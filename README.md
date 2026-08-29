@@ -88,22 +88,6 @@ Processed data is stored in **Parquet format on HDFS**.
                   │ Power BI│
                   └─────────┘
 ```
-##🐳 Running the Project
-
-Start the Docker environment:
-
-docker compose up -d
-
-Check the running services:
-
-docker compose ps
-
-Run a Spark application:
-
-docker exec -it spark-master \
-/spark/bin/spark-submit \
---master spark://spark-master:7077 \
-/opt/spark-apps/ais_ml.py
 
 ## 🎯 Project Goals
 
