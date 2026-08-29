@@ -1,0 +1,425 @@
+name: bigdata-lab
+
+# =============================================================================
+# Shared environment block used by all Airflow containers.
+# Kafka references removed — Kafka is not part of the AIS architecture.
+# Added: YARN ResourceManager address + Spark Thrift Server address so DAGs
+# (via SparkSubmitOperator / JDBC hooks) can reach every layer of the stack.
+# =============================================================================
+x-airflow-common-env: &airflow-common-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+  AIRFLOW__CORE__FERNET_KEY: ""
+  AIRFLOW__WEBSERVER__SECRET_KEY: "change-me-please"
+  HDFS_NAMENODE: "hdfs://namenode:9000"
+  SPARK_MASTER: "spark://spark-master:7077"
+  SPARK_THRIFT_JDBC_URL: "jdbc:hive2://spark-thrift-server:10000"
+  YARN_RESOURCEMANAGER: "resourcemanager:8032"
+
+networks:
+  bigdata-net:
+    name: bigdata-net
+
+volumes:
+  namenode_data:
+  datanode_data:
+  postgres_data:
+
+services:
+  # ===========================================================================
+  # HDFS — Distributed Storage (diagram block 3 + Hadoop Cluster box)
+  # ===========================================================================
+  namenode:
+    image: bde2020/hadoop-namenode:${HADOOP_IMAGE_TAG}
+    container_name: namenode
+    hostname: namenode
+    restart: unless-stopped
+    env_file: ./hadoop/hadoop.env
+    environment:
+      - CLUSTER_NAME=bigdata-lab
+      # Bootstraps the /ais_data tree (raw, processed, results) shown in the
+      # diagram's "Distributed Storage" and "Data Storage (Processed)" steps.
+      - HDFS_CONF_dfs_replication=3
+    ports:
+      - "${NAMENODE_UI_PORT}:9870" 
+      - "${HDFS_RPC_PORT}:9000"      
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+      - ./data:/data
+    networks: [bigdata-net]
+
+  datanode:
+    image: bde2020/hadoop-datanode:${HADOOP_IMAGE_TAG}
+    container_name: datanode
+    hostname: datanode
+    restart: unless-stopped
+    depends_on: [namenode]
+    env_file: ./hadoop/hadoop.env
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870
+      - HDFS_CONF_dfs_replication=3
+    ports:
+      - "${DATANODE_UI_PORT}:9864"
+    volumes:
+      - datanode_data:/hadoop/dfs/data
+    networks: [bigdata-net]
+
+  # One-shot job: creates /ais_data/raw, /ais_data/processed, /ais_data/results
+  # so every downstream step (ingestion, Spark processing, MLlib results) has
+  # the directory structure shown in the diagram before the pipeline runs.
+  hdfs-init:
+    image: bde2020/hadoop-namenode:${HADOOP_IMAGE_TAG}
+    container_name: hdfs-init
+
+    depends_on:
+      - namenode
+      - datanode
+
+    env_file:
+      - ./hadoop/hadoop.env
+
+    entrypoint: >
+      bash -c "
+      until hdfs dfs -fs hdfs://namenode:9000 -ls / ; do
+        echo 'Waiting for HDFS...';
+        sleep 3;
+      done &&
+      hdfs dfs -fs hdfs://namenode:9000 -mkdir -p
+      /ais_data/raw
+      /ais_data/processed
+      /ais_data/results
+      /ais_data/analytics
+      /ais_data/powerbi
+      /ais_data/warehouse
+      &&
+      hdfs dfs -fs hdfs://namenode:9000 -chmod -R 777 /ais_data
+      &&
+      echo 'HDFS directories initialized.'
+      "
+
+    networks:
+      - bigdata-net
+
+  # ===========================================================================
+  # YARN — Resource Management (Hadoop Cluster box: HDFS, YARN)
+  # ===========================================================================
+  resourcemanager:
+    image: bde2020/hadoop-resourcemanager:${HADOOP_IMAGE_TAG}
+    container_name: resourcemanager
+    hostname: resourcemanager
+    restart: unless-stopped
+    depends_on: [namenode, datanode]
+    env_file: ./hadoop/hadoop.env
+    environment:
+      - SERVICE_PRECONDITION=namenode:9000 namenode:9870 datanode:9864
+    ports:
+      - "${YARN_RM_UI_PORT}:8088"    # YARN ResourceManager Web UI
+    networks: [bigdata-net]
+
+  nodemanager:
+    image: bde2020/hadoop-nodemanager:${HADOOP_IMAGE_TAG}
+    container_name: nodemanager
+    hostname: nodemanager
+    restart: unless-stopped
+    depends_on: [resourcemanager]
+    env_file: ./hadoop/hadoop.env
+    environment:
+      - SERVICE_PRECONDITION=namenode:9000 namenode:9870 datanode:9864 resourcemanager:8088
+    ports:
+      - "${YARN_NM_UI_PORT}:8042"    # NodeManager Web UI
+    networks: [bigdata-net]
+
+  historyserver:
+    image: bde2020/hadoop-historyserver:${HADOOP_IMAGE_TAG}
+    container_name: historyserver
+    hostname: historyserver
+    restart: unless-stopped
+    depends_on: [resourcemanager]
+    env_file: ./hadoop/hadoop.env
+    environment:
+      - SERVICE_PRECONDITION=namenode:9000 namenode:9870 datanode:9864 resourcemanager:8088
+    ports:
+      - "${YARN_HISTORY_UI_PORT}:8188"
+    volumes:
+      - namenode_data:/hadoop/yarn/timeline
+    networks: [bigdata-net]
+
+  # ===========================================================================
+  # Spark — Distributed Processing + Analytics (diagram steps 4-6)
+  # ===========================================================================
+  spark-master:
+    image: bde2020/spark-master:${SPARK_IMAGE_TAG}
+    container_name: spark-master
+    hostname: spark-master
+    restart: unless-stopped
+    environment:
+      - INIT_DAEMON_STEP=setup_spark
+    ports:
+      - "${SPARK_MASTER_UI_PORT}:8080"  # Spark Master UI
+      - "${SPARK_MASTER_PORT}:7077"     # Spark Master RPC
+    volumes:
+      - ./spark/apps:/opt/spark-apps
+      - ./spark/data:/opt/spark-data
+    networks: [bigdata-net]
+
+  spark-worker:
+    image: bde2020/spark-worker:${SPARK_IMAGE_TAG}
+    container_name: spark-worker
+    hostname: spark-worker
+    restart: unless-stopped
+    depends_on: [spark-master]
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_WORKER_CORES=4
+    ports:
+      - "${SPARK_WORKER_UI_PORT}:8081"  # Spark Worker UI
+    volumes:
+      - ./spark/apps:/opt/spark-apps
+      - ./spark/data:/opt/spark-data
+    networks: [bigdata-net]
+
+  # ---------------------------------------------------------------------------
+  # Spark SQL Thrift Server — diagram step 9 ("Thrift Server: SQL Interface
+  # for External Applications"). Exposes port 10000 for JDBC/ODBC so Power BI
+  # (step 10) can query the /ais_data/results Parquet tables directly.
+  # ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+  # Spark SQL Thrift Server
+  # ---------------------------------------------------------------------------
+    # ===========================================================================
+  # Spark SQL Thrift Server
+  # Provides JDBC/ODBC access for Power BI
+  # ===========================================================================
+
+  spark-thrift-server:
+    image: bde2020/spark-master:${SPARK_IMAGE_TAG}
+    container_name: spark-thrift-server
+    hostname: spark-thrift-server
+    restart: unless-stopped
+
+    depends_on:
+      - namenode
+      - datanode
+      - spark-master
+      - spark-worker
+
+    entrypoint:
+      - /spark/bin/spark-submit
+
+    command:
+      - --master
+      - spark://spark-master:7077
+      - --class
+      - org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
+      - --name
+      - "Thrift JDBC/ODBC Server"
+      - --conf
+      - spark.sql.warehouse.dir=hdfs://namenode:9000/ais_data/warehouse
+      - --conf
+      - spark.driver.bindAddress=0.0.0.0
+      - --conf
+      - spark.driver.host=spark-thrift-server
+      - --conf
+      - spark.driver.port=4041
+      - --conf
+      - spark.executor.memory=1g
+      - --conf
+      - spark.executor.memoryOverhead=256m
+      - --conf
+      - spark.sql.shuffle.partitions=8
+
+    environment:
+      SPARK_HOME: /spark
+      HADOOP_CONF_DIR: /opt/hadoop-conf
+
+    ports:
+      - "${SPARK_THRIFT_PORT}:10000"
+
+    volumes:
+      - ./spark/apps:/opt/spark-apps
+      - ./spark/data:/opt/spark-data
+      - ./airflow/hadoop-conf:/opt/hadoop-conf:ro
+
+    networks:
+      - bigdata-net
+    # NOTE: the exact script path (/spark/sbin/start-thriftserver.sh) depends
+    # on the bde2020/spark-master image's internal layout/version. If your
+    # image places the Spark distribution elsewhere, update the entrypoint
+    # path accordingly (check `docker run <image> find / -name start-thriftserver.sh`).
+
+  # ===========================================================================
+  # Airflow — Orchestration Layer (schedules/monitors the full pipeline)
+  # ===========================================================================
+
+
+  postgres:
+    image: postgres:${POSTGRES_IMAGE_TAG}
+    container_name: airflow-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    networks: [bigdata-net]
+
+
+  # ---------------------------------------------------------------------------
+  # Airflow initialization
+  # ---------------------------------------------------------------------------
+
+  airflow-init:
+    build:
+      context: ./airflow/docker
+      args:
+        AIRFLOW_BASE_IMAGE: ${AIRFLOW_BASE_IMAGE}
+
+    image: bigdata-lab-airflow:local
+    container_name: airflow-init
+
+    depends_on:
+      - postgres
+
+    environment:
+      <<: *airflow-common-env
+
+      # Hadoop client configuration
+      HADOOP_CONF_DIR: /opt/hadoop-conf
+
+    entrypoint: >
+      bash -c "
+      airflow db migrate &&
+      airflow users create
+      --username ${AIRFLOW_ADMIN_USER}
+      --password ${AIRFLOW_ADMIN_PASSWORD}
+      --firstname Admin
+      --lastname User
+      --role Admin
+      --email ${AIRFLOW_ADMIN_EMAIL}
+      "
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+
+      # Hadoop client configuration
+      - ./airflow/hadoop-conf:/opt/hadoop-conf
+
+      # Spark applications
+      - ./spark/apps:/opt/spark-apps
+
+    networks: [bigdata-net]
+
+
+  # ---------------------------------------------------------------------------
+  # Airflow Webserver
+  # ---------------------------------------------------------------------------
+
+  airflow-webserver:
+    build:
+      context: ./airflow/docker
+      args:
+        AIRFLOW_BASE_IMAGE: ${AIRFLOW_BASE_IMAGE}
+
+    image: bigdata-lab-airflow:local
+    container_name: airflow-webserver
+
+    restart: unless-stopped
+
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+      spark-master:
+        condition: service_started
+
+      namenode:
+        condition: service_started
+
+    environment:
+      <<: *airflow-common-env
+
+      # Hadoop client configuration
+      HADOOP_CONF_DIR: /opt/hadoop-conf
+
+    command: webserver
+
+    ports:
+      - "${AIRFLOW_WEBSERVER_PORT}:8080"
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+
+      # Hadoop client configuration
+      - ./airflow/hadoop-conf:/opt/hadoop-conf
+
+      # Spark applications
+      - ./spark/apps:/opt/spark-apps
+
+    networks: [bigdata-net]
+
+
+  # ---------------------------------------------------------------------------
+  # Airflow Scheduler
+  # ---------------------------------------------------------------------------
+
+  airflow-scheduler:
+    build:
+      context: ./airflow/docker
+      args:
+        AIRFLOW_BASE_IMAGE: ${AIRFLOW_BASE_IMAGE}
+
+    image: bigdata-lab-airflow:local
+    container_name: airflow-scheduler
+
+    restart: unless-stopped
+
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+      spark-master:
+        condition: service_started
+
+      namenode:
+        condition: service_started
+
+    environment:
+      <<: *airflow-common-env
+
+      # Hadoop client configuration
+      HADOOP_CONF_DIR: /opt/hadoop-conf
+
+    command: scheduler
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+
+      # Hadoop client configuration
+      - ./airflow/hadoop-conf:/opt/hadoop-conf
+
+      # Spark applications
+      - ./spark/apps:/opt/spark-apps
+
+    networks: [bigdata-net]
+# =============================================================================
+# .env additions required for the new/changed variables used above:
+#   YARN_RM_UI_PORT=8088
+#   YARN_NM_UI_PORT=8042
+#   YARN_HISTORY_UI_PORT=8188
+#   SPARK_THRIFT_PORT=10000
+# (KAFKA_* and JUPYTER_PORT variables can be removed from .env — no longer used)
+# =============================================================================

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment / secrets
+.env
+
+# Git
+.git/
+
+# Large data
+*.csv
+*.parquet
+*.json
+
+# Spark
+spark-warehouse/
+metastore_db/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+.env
+.env.*
+hadoop.env
