@@ -2,6 +2,12 @@
 
 A Big Data project for processing and analyzing large-scale **Automatic Identification System (AIS)** vessel data to understand maritime traffic, vessel activity, and geographic patterns.
 
+## 🎥 Project Demo
+
+Watch the full project demo here:
+
+👉 [Click here to watch the Project Demo](https://drive.google.com/file/d/1va9BAkBDoOO7p41YetYq-B75Rit22H4U/view?usp=sharing)
+
 ## 📊 Dashboard
 
 ### Overview
