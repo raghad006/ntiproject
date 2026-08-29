@@ -27,7 +27,7 @@ AIS Data → Hadoop HDFS → Apache Spark → Spark Thrift Server → Power BI
                                  Spark MLlib
                               Vessel Clustering
 ```
-
+![Marine AIS Dashboard - Overview](docs/Arc.jpeg)
 ## 🛠️ Tech Stack
 
 * **Apache Airflow** — Workflow orchestration
