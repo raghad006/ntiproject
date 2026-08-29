@@ -88,7 +88,7 @@ Processed data is stored in **Parquet format on HDFS**.
                   │ Power BI│
                   └─────────┘
 ```
-🐳 Running the Project
+##🐳 Running the Project
 
 Start the Docker environment:
 
